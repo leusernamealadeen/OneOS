@@ -23,24 +23,16 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # Fix: API 37 platform package is "platforms;android-37.0".
-      # Space-separated string avoids any ambiguity in the action's parser.
       - name: Set up Android SDK (platform 37)
         uses: android-actions/setup-android@v4
         with:
           packages: 'platforms;android-37.0 build-tools;37.0.0'
 
-      # Fix: Gradle looks for "platforms/android-37"; sdkmanager installs
-      # "platforms/android-37.0". Symlink the two names.
       - name: Symlink android-37 to installed android-37.0
         run: |
           SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
           if [ -d "$SDK_ROOT/platforms/android-37.0" ]; then
             ln -sfn android-37.0 "$SDK_ROOT/platforms/android-37"
-            echo "Symlinked android-37 -> android-37.0"
-          else
-            echo "::warning::android-37.0 directory not found at $SDK_ROOT/platforms"
-            ls -1 "$SDK_ROOT/platforms" || true
           fi
 
       - name: Setup Gradle
@@ -49,9 +41,6 @@ jobs:
       - name: Remove hardcoded JDK path from gradle.properties
         run: sed -i '/org.gradle.java.home/d' gradle.properties || true
 
-      # OneOS's build.gradle.kts requires this file to exist before
-      # assembleFullRelease will configure. Generate a throwaway key
-      # so no external keystore or secrets are needed.
       - name: Generate throwaway self-signed keystore
         run: |
           mkdir -p ~/.oneos-release
@@ -80,19 +69,22 @@ jobs:
             "https://api.github.com/repos/fahadalijaved/OneOS-files/releases/tags/sets-1" \
             -o /tmp/release.json
           jq -r '.assets[].browser_download_url' /tmp/release.json | while read -r url; do
-            echo "Downloading $url"
             curl -sL -H "Authorization: Bearer $GH_TOKEN" "$url" -O --output-dir out/
           done
-          count=$(ls -1 out/ | wc -l)
-          echo "Downloaded $count files into out/"
-          if [ "$count" -eq 0 ]; then
-            echo "::error::No assets were downloaded. Check the release tag and token permissions."
-            exit 1
-          fi
-          echo "=== Sample of out/ contents ==="
-          ls -1 out/ | head -20
+          echo "Downloaded $(ls -1 out/ | wc -l) files into out/"
+
+      # Fix: Inject PAT for tribalfs packages and clear the default GITHUB_TOKEN
+      - name: Configure GitHub Packages credentials
+        run: |
+          mkdir -p ~/.gradle
+          echo "gpr.user=${{ github.actor }}" >> ~/.gradle/gradle.properties
+          echo "gpr.key=${{ secrets.PACKAGES_READ_TOKEN }}" >> ~/.gradle/gradle.properties
+          echo "GH_PACKAGES_TOKEN=${{ secrets.PACKAGES_READ_TOKEN }}" >> $GITHUB_ENV
 
       - name: Build guest manager release APK
+        env:
+          # Unset the default token so build scripts relying on it don't use the wrong one
+          GITHUB_TOKEN: ""
         run: |
           chmod +x scripts/build-guest-manager.sh
           ./scripts/build-guest-manager.sh release
@@ -108,6 +100,8 @@ jobs:
 
       - name: Build full release APK
         working-directory: app-android
+        env:
+          GITHUB_TOKEN: ""
         run: ./gradlew assembleFullRelease --stacktrace
 
       - name: Upload full release APK as workflow artifact
@@ -126,13 +120,3 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload build reports on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-reports
-          path: |
-            **/build/reports/**
-            **/build/outputs/logs/**
-          if-no-files-found: ignore
