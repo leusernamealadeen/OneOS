@@ -1,0 +1,116 @@
+name: Release OneOS Full APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK (platform 37)
+        uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            platforms;android-37
+            build-tools;37.0.0
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Remove hardcoded JDK path from gradle.properties
+        run: sed -i '/org.gradle.java.home/d' gradle.properties || true
+
+      # OneOS's build.gradle.kts requires this file to exist before
+      # assembleFullRelease will configure. We generate a throwaway
+      # self-signed key so no external keystore or secrets are needed.
+      - name: Generate throwaway self-signed keystore
+        run: |
+          mkdir -p ~/.oneos-release
+          keytool -genkeypair \
+            -keystore "$HOME/.oneos-release/keystore.jks" \
+            -storetype PKCS12 \
+            -alias oneos-ci \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass oneosci -keypass oneosci \
+            -dname "CN=OneOS CI, OU=CI, O=OneOS, L=CI, ST=CI, C=US"
+          cat > "$HOME/.oneos-release/keystore.properties" <<EOF
+          storeFile=$HOME/.oneos-release/keystore.jks
+          storePassword=oneosci
+          keyAlias=oneos-ci
+          keyPassword=oneosci
+          EOF
+
+      - name: Download OneOS package sets (sets-1)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p out
+          curl -sL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/fahadalijaved/OneOS-files/releases/tags/sets-1" \
+            -o /tmp/release.json
+          jq -r '.assets[].browser_download_url' /tmp/release.json | while read -r url; do
+            echo "Downloading $url"
+            curl -sL -H "Authorization: Bearer $GH_TOKEN" "$url" -O --output-dir out/
+          done
+          count=$(ls -1 out/ | wc -l)
+          echo "Downloaded $count files into out/"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No assets were downloaded. Check the release tag and token permissions."
+            exit 1
+          fi
+
+      - name: Build guest manager release APK
+        run: |
+          chmod +x scripts/build-guest-manager.sh
+          ./scripts/build-guest-manager.sh release
+          cp app-android/guest/build/outputs/apk/release/guest-release.apk \
+             switcher/assets/guest_manager.apk
+
+      - name: Build full release APK
+        working-directory: app-android
+        run: ./gradlew assembleFullRelease --stacktrace
+
+      - name: Upload full release APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OneOS-full-release
+          path: app-android/app/build/outputs/apk/full/release/app-full-release.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release and attach APK
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app-android/app/build/outputs/apk/full/release/app-full-release.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            **/build/reports/**
+            **/build/outputs/logs/**
+          if-no-files-found: ignore
